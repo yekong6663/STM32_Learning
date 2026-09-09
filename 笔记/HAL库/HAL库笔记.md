@@ -2619,7 +2619,368 @@ HAL_I2C_Master_Receive_DMA(&hi2c1, AHT20_ADDRESS, AHT20ReadBuffer, 6);  // DMA�
 
 > 本节代码虽然将 IIC 收发改成了非阻塞方式，但视频示例中仍使用了 `HAL_Delay(75)` 和 `HAL_Delay(1000)`，因此整个程序并不是完全非阻塞；本节重点是学习 **IIC中断/DMA + 回调函数 + 状态机** 的配合方式。
 
-[1]: https://www.bilibili.com/video/BV1AN41127VL?utm_source=chatgpt.com "〖STM32入门教程-2025〗第13集 IIC的中断与DMA以及状态机编程_哔哩哔哩_bilibili"
-[2]: https://keysking.com/docs/stm32/HAL/?utm_source=chatgpt.com "HAL库函数速查手册 | 波特律动"
-[3]: https://jishuzhan.net/article/1720317906476077057 "STM32:AHT20温湿度传感器驱动程序开发 - 技术栈"
+
+
+# 6 OLED显示
+## 6.1 OLED原理、驱动库与取模
+本节使用 OLED 屏幕进一步练习上一章学习的 IIC 通信，主要学习 **OLED 的基本显示原理、SSD1306 驱动芯片、视频提供的 OLED 驱动库以及字符和汉字的取模显示**。实际使用时不需要自己从头编写 SSD1306 的底层通信代码，而是直接使用已经提供好的 OLED 驱动库。
+
+### OLED基本结构
+本节使用的 OLED 分辨率为 **128×64**，也就是一共有：
+$$128\times64=8192$$
+个像素。如果 STM32 直接控制每一个像素会非常麻烦，因此 OLED 模块内部使用 **SSD1306** 驱动芯片。可以简单理解为：**STM32 → IIC → SSD1306 → OLED像素点**，STM32 只需要通过驱动库告诉 SSD1306“显示什么”，具体像素的控制由 SSD1306 完成。
+
+![alt text](image-73.png)
+
+#### SSD1306的分页
+![alt text](image-74.png)
+
+SSD1306 将 128×64 的屏幕纵向划分为 **8个 Page**，每个 Page 高8个像素，即：**Page0～Page7，每个 Page = 128列 × 8行像素。**
+
+因此驱动库中常见的坐标可以理解为：`x = 0~127` 表示横向列坐标，`y = 0~7` 表示 Page 编号。
+
+> 这里的 `y` 并不是单个像素的纵坐标，而是 **Page编号**。一个 Page 包含纵向8个像素。
+
+SSD1306 在这种显示方式下，每写入1字节数据，8个 bit 就可以控制当前列纵向的8个像素。因此：**1字节显示数据 → 当前列8个纵向像素。**
+
+### OLED驱动库
+视频已经提供了完整的 OLED 驱动库，实际使用时主要关注**如何把驱动库加入工程以及如何调用其中已经封装好的函数**，不需要自己实现 IIC 时序、SSD1306 命令发送、Page地址设置等底层代码。
+
+驱动库可以简单理解为：
+**用户程序 → OLED驱动库 → IIC → SSD1306 → OLED**
+
+### 字模
+
+OLED 并不知道 `'A'`、`'1'` 或汉字本身是什么意思，它最终只认识**哪些像素亮、哪些像素灭**。因此显示文字时，需要提前将字符转换成对应的点阵数据，这些点阵数据就是**字模**。
+
+### 汉字显示与取模
+
+ASCII 字符数量有限，可以直接将常用字符的完整字模保存在 `codetab.h` 中；但汉字数量非常多，不可能全部保存进 STM32，因此一般只对程序实际需要显示的汉字进行取模。
+
+> 注意：OLED取模工具与驱动库：[在线取模工具](https://les.baud-dance.com/)
+
+
+## 6.2 温湿度计实战（AHT20+OLED）
+本节将前面已经学习的 **AHT20 温湿度传感器**与 **OLED 显示库**组合起来，快速制作一个温湿度计。AHT20 和 OLED 都通过 IIC 与 STM32 通信，因此可以挂载在同一条 IIC 总线上，通过不同的设备地址区分。
+
+整个过程为：**AHT20采集温湿度 → STM32读取数据 → `sprintf()`转换为字符串 → OLED显示温湿度**
+
+### CubeMX工程配置
+#### 配置外部高速时钟
+首先进入 **System Core → RCC**，将：
+
+`High Speed Clock (HSE)` → `Crystal/Ceramic Resonator`
+![alt text](image-76.png)
+
+
+也就是使用开发板上的**外部高速晶振**作为后续系统时钟源。
+
+#### 配置系统时钟
+进入 **Clock Configuration**，将：
+- `PLL Source Mux` → `HSE`
+- `System Clock Mux` → `PLLCLK`
+- `HCLK` → `72 MHz`
+
+![alt text](image-75.png)
+
+最终使 STM32F103 的系统主频运行在 **72 MHz**。
+
+可以简单理解为：**外部晶振 HSE → PLL倍频 → SYSCLK → HCLK = 72MHz**
+
+> 这一部分虽然和 OLED、AHT20 的功能没有直接关系，但是一个正常工程通常需要先将系统时钟配置好，后面的 IIC、延时等外设都会基于系统时钟工作。
+
+#### 配置I2C1
+进入 **Connectivity → I2C1**，将模式设置为：
+
+`I2C`
+
+随后在 `Parameter Settings` 中将：
+
+`I2C Speed Mode` → `Fast Mode`
+
+![alt text](image-77.png)
+
+AHT20 和 OLED 都连接在 I2C1 上，因此**只需要配置一组 I2C1，不需要分别为两个设备配置两套 IIC**。
+
+IIC 支持一主多从，因此可以理解为：
+
+**STM32(IIC主机) → I2C1总线 → AHT20 + OLED**
+
+AHT20 和 OLED 具有不同的从机地址，所以 STM32 可以在同一组 `SCL`、`SDA` 上分别与它们通信。
+
+#### Code Generator配置
+进入 **Project Manager → Code Generator**，勾选：
+
+`Generate peripheral initialization as a pair of '.c/.h' files per peripheral`
+
+这样生成工程后，I2C 等外设会分别生成对应的 `.c/.h` 文件，方便后面驱动库直接引用。
+
+#### 开启sprintf浮点数支持
+本节需要使用 `sprintf()` 将 `float` 类型的温度、湿度转换为字符串，因此需要打开浮点数格式化支持：
+
+**Project → Properties → C/C++ Build → Settings → Tool Settings → MCU Settings → Use float with printf from newlib-nano**
+
+否则：
+
+```c
+sprintf(message, "%.1f", temperature);
+```
+
+中的 `%f` 可能无法正常输出浮点数。
+
+> 本节**没有使用串口**，开启浮点输出支持是因为 OLED 显示前仍然需要利用 `sprintf()` 把浮点数转换成字符串。
+
+### 导入AHT20与OLED驱动库
+视频并不重新编写 AHT20 和 OLED 的底层代码，而是直接使用前面提供好的驱动库。
+
+将源文件放入：
+
+`Core/Src`
+
+例如：
+- `aht20.c`
+- `oled.c`
+- `font.c`
+
+将头文件放入：
+
+`Core/Inc`
+
+例如：
+- `aht20.h`
+- `oled.h`
+- `font.h`
+
+整个程序结构可以理解为：
+
+**main.c → AHT20驱动 / OLED驱动 → HAL I2C → I2C1 → 外部设备**
+
+在 `main.c` 中加入：
+
+```c
+/* USER CODE BEGIN Includes */
+#include "aht20.h"    // AHT20温湿度传感器驱动
+#include "oled.h"     // keysking提供的OLED驱动库
+#include <stdio.h>    // sprintf()
+/* USER CODE END Includes */
+```
+
+### OLED驱动库的使用
+keysking 提供的 OLED 库已经将 OLED 底层通信和绘图过程封装完成，因此在 `main.c` 中主要调用几个高级函数即可。
+
+#### OLED_Init
+```c
+OLED_Init();    // 初始化OLED
+```
+
+负责完成 OLED 驱动芯片的初始化，实际使用时不需要自己重新编写 OLED 寄存器初始化代码。
+
+由于单片机启动速度可能比 OLED 上电稳定速度快，所以初始化前先等待一段时间：
+
+```c
+HAL_Delay(20);    // 等待OLED上电稳定
+OLED_Init();      // 初始化OLED
+```
+
+#### OLED_NewFrame
+```c
+OLED_NewFrame();    // 创建一帧新的空白画面
+```
+
+OLED 库会先在 STM32 内存中维护一块**显示缓冲区**。`OLED_NewFrame()` 会清空这一块缓冲区，相当于准备一张新的“画布”。
+
+> `OLED_NewFrame()` 并不会马上更新 OLED 屏幕，只是在内存中准备新的显示内容。
+
+#### OLED_PrintString
+用于将字符串绘制到当前显示缓冲区：
+
+```c
+OLED_PrintString(0, 16, "Hello", &font16x16, OLED_COLOR_NORMAL); // 在指定位置绘制字符串
+```
+
+常见形式：
+
+```c
+OLED_PrintString(x, y, str, font, color);
+```
+
+| 参数 | 作用 |
+|---|---|
+| `x` | 起始横坐标 |
+| `y` | 起始纵坐标 |
+| `str` | 要显示的字符串 |
+| `font` | 使用的字体 |
+| `color` | 正常显示或反色显示 |
+
+例如 `&font16x16` 表示使用 **16×16 字体**，`OLED_COLOR_NORMAL` 表示正常显示。
+
+#### OLED_ShowFrame
+```c
+OLED_ShowFrame();    // 将显示缓冲区真正刷新到OLED
+```
+
+前面所有 `OLED_PrintString()` 等函数主要是在内存缓冲区中修改画面，最后必须调用 `OLED_ShowFrame()` 才会把这一整帧发送到 OLED。
+
+因此 OLED 显示的基本流程为：
+
+**`OLED_NewFrame()`准备画面 → `OLED_PrintString()`绘制内容 → `OLED_ShowFrame()`刷新屏幕**
+
+> 如果只调用 `OLED_PrintString()` 而没有调用 `OLED_ShowFrame()`，屏幕不会显示最新内容。
+
+### OLED字模与在线取模
+OLED 最终显示的是点阵像素，因此中文字符需要提前转换成对应的**字模数据**。ASCII 字符已经包含在 keysking 提供的字体库中，可以直接使用；中文字符数量太多，不会全部存入 STM32，需要把实际使用到的汉字单独取模。
+
+在线取模工具：[波特律动在线取模](https://les.baud-dance.com/)
+
+#### 中文取模
+本节需要显示温湿度，因此至少需要准备：
+
+`温`、`湿`、`度`、`℃`
+
+基本流程为：
+
+**打开取模网站 → 输入需要使用的中文字符 → 选择对应字体大小 → 生成字模代码 → 复制字模 → 加入 `font.c`**
+
+同时按照生成的代码和驱动库要求，在 `font.h` 中加入对应声明。
+
+> 不需要把所有汉字全部加入工程，只需要把程序实际显示到的汉字进行取模，可以节省 Flash 空间。
+
+例如最终使用：
+
+```c
+OLED_PrintString(0, 16, message_temp, &font16x16, OLED_COLOR_NORMAL);
+```
+
+那么 `message_temp` 中出现的中文字符必须已经包含在 `font16x16` 对应的字模中，否则 OLED 无法正确显示这些汉字。
+
+#### ASCII字符
+数字、英文字母、空格、冒号、百分号等常见 ASCII 字符，keysking 提供的字体库中已经包含，因此通常不需要另外取模。
+
+所以：`温度: 25.6 ℃`
+
+其中 `温`、`度`、`℃` 需要准备中文字模，而数字、`.`、`:`、空格等可以直接使用字体库已有的 ASCII 字模。
+
+### 初始化
+CubeMX 初始化完成后，再初始化 AHT20 和 OLED：
+
+```c
+/* USER CODE BEGIN 2 */
+AHT20_Init();          // 初始化AHT20温湿度传感器
+
+HAL_Delay(20);         // 等待OLED上电稳定
+OLED_Init();           // 初始化OLED
+
+float temperature;     // 保存温度
+float humidity;        // 保存湿度
+char message_temp[30]; // OLED显示温度字符串
+char message_hum[30];  // OLED显示湿度字符串
+/* USER CODE END 2 */
+```
+
+这里两个模块都使用 I2C1，但它们拥有不同的设备地址，因此不会发生冲突。
+
+### 读取温湿度
+前面已经将 AHT20 的底层操作封装到了驱动库中，因此这里只需要：
+
+```c
+AHT20_Read(&temperature, &humidity); // 读取当前温度和湿度
+```
+
+执行完成后：
+- `temperature` 保存实际温度
+- `humidity` 保存实际湿度
+
+不需要再在 `main.c` 中重新进行 IIC 收发和原始数据解析。
+
+### sprintf生成OLED字符串
+OLED 的字符串显示函数需要接收字符串，而 AHT20 得到的是 `float` 类型，因此使用 `sprintf()` 将数据格式化：
+
+```c
+// 将温度转换为字符串，%.1f表示保留1位小数
+sprintf(message_temp, "温度: %.1f ℃", temperature);
+
+// 将湿度转换为字符串，%%表示真正输出一个%
+sprintf(message_hum, "湿度: %.1f %%", humidity);
+```
+
+例如：
+`temperature = 25.67` → `"温度: 25.7 ℃"`  
+`humidity = 63.24` → `"湿度: 63.2 %"`
+
+这里 `%` 在 `sprintf()` 中本身具有格式控制作用，因此想真正显示一个百分号，需要写成 `%%`。
+
+### OLED显示温湿度
+得到两个字符串后，使用 OLED 驱动库进行显示：
+
+```c
+OLED_NewFrame(); // 新建一帧空白画面
+
+// 在OLED第16像素高度处显示温度
+OLED_PrintString(0, 16,
+                 message_temp,
+                 &font16x16,
+                 OLED_COLOR_NORMAL);
+
+// 在OLED第32像素高度处显示湿度
+OLED_PrintString(0, 32,
+                 message_hum,
+                 &font16x16,
+                 OLED_COLOR_NORMAL);
+
+OLED_ShowFrame(); // 将整帧内容刷新到OLED
+```
+
+这里温度放在 `y = 16`，湿度放在 `y = 32`，使两个字符串分别显示在不同的位置。
+
+### 主循环完整代码
+```c
+/* USER CODE BEGIN WHILE */
+while (1)
+{
+    // 从AHT20读取当前温湿度
+    AHT20_Read(&temperature, &humidity);
+
+    // 将float类型温湿度转换成OLED需要显示的字符串
+    sprintf(message_temp, "温度: %.1f ℃", temperature);
+    sprintf(message_hum, "湿度: %.1f %%", humidity);
+
+    // 创建一帧新的OLED画面
+    OLED_NewFrame();
+
+    // 显示温度
+    OLED_PrintString(0, 16,
+                     message_temp,
+                     &font16x16,
+                     OLED_COLOR_NORMAL);
+
+    // 显示湿度
+    OLED_PrintString(0, 32,
+                     message_hum,
+                     &font16x16,
+                     OLED_COLOR_NORMAL);
+
+    // 将当前缓冲区中的整帧画面刷新到OLED
+    OLED_ShowFrame();
+
+    HAL_Delay(1000); // 每隔1s重新读取并刷新一次
+}
+/* USER CODE END WHILE */
+```
+
+整个程序不需要自己编写 AHT20 和 OLED 的底层通信，只需要调用已经封装好的驱动接口：
+
+**`AHT20_Read()`负责获得数据 → `sprintf()`负责转换字符串 → OLED驱动库负责显示**
+
+### 本节整体流程
+CubeMX 部分：
+
+**开启HSE → 系统时钟配置为72MHz → 开启I2C1 Fast Mode → 生成工程**
+
+代码部分：
+
+**导入AHT20库 + OLED库 + 字体库 → 为“温湿度℃”取模 → 初始化AHT20 → 初始化OLED → 读取温湿度 → `sprintf()`生成字符串 → `OLED_NewFrame()` → `OLED_PrintString()` → `OLED_ShowFrame()`**
+
+> **AHT20和OLED都属于IIC从机，可以共用同一个I2C1；STM32根据不同设备地址选择需要通信的设备。**
+
+> **keysking提供的OLED库已经封装好了OLED底层驱动，实际使用时重点掌握 `OLED_Init()`、`OLED_NewFrame()`、`OLED_PrintString()`、`OLED_ShowFrame()` 以及字模的添加方法即可。**
 
